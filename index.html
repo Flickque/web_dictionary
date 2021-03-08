@@ -1,0 +1,344 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+  <title>Mind Map</title>
+  <!-- Copyright 1998-2021 by Northwoods Software Corporation. -->
+  <meta name="description" content="A mind map editor, showing how subtrees can be moved, copied, deleted, and laid out." />
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <script src="https://unpkg.com/gojs/release/go.js"></script>
+  <script id="code">
+    function init() {
+      if (window.goSamples) goSamples();  // init for these samples -- you don't need to call this
+      var $ = go.GraphObject.make;
+
+      myDiagram =
+        $(go.Diagram, "myDiagramDiv",
+          {
+            // when the user drags a node, also move/copy/delete the whole subtree starting with that node
+            "commandHandler.copiesTree": true,
+            "commandHandler.copiesParentKey": true,
+            "commandHandler.deletesTree": true,
+            "draggingTool.dragsTree": true,
+            "undoManager.isEnabled": true
+          });
+
+      // when the document is modified, add a "*" to the title and enable the "Save" button
+      myDiagram.addDiagramListener("Modified", function(e) {
+        var button = document.getElementById("SaveButton");
+        if (button) button.disabled = !myDiagram.isModified;
+        var idx = document.title.indexOf("*");
+        if (myDiagram.isModified) {
+          if (idx < 0) document.title += "*";
+        } else {
+          if (idx >= 0) document.title = document.title.substr(0, idx);
+        }
+      });
+
+      // a node consists of some text with a line shape underneath
+      myDiagram.nodeTemplate =
+        $(go.Node, "Vertical",
+          { selectionObjectName: "TEXT" },
+          $(go.TextBlock,
+            {
+              name: "TEXT",
+              minSize: new go.Size(30, 15),
+              editable: true
+            },
+            // remember not only the text string but the scale and the font in the node data
+            new go.Binding("text", "text").makeTwoWay(),
+            new go.Binding("scale", "scale").makeTwoWay(),
+            new go.Binding("font", "font").makeTwoWay()),
+          $(go.Shape, "LineH",
+            {
+              stretch: go.GraphObject.Horizontal,
+              strokeWidth: 3, height: 3,
+              // this line shape is the port -- what links connect with
+              portId: "", fromSpot: go.Spot.LeftRightSides, toSpot: go.Spot.LeftRightSides
+            },
+            new go.Binding("stroke", "brush"),
+            // make sure links come in from the proper direction and go out appropriately
+            new go.Binding("fromSpot", "dir", function(d) { return spotConverter(d, true); }),
+            new go.Binding("toSpot", "dir", function(d) { return spotConverter(d, false); })),
+          // remember the locations of each node in the node data
+          new go.Binding("location", "loc", go.Point.parse).makeTwoWay(go.Point.stringify),
+          // make sure text "grows" in the desired direction
+          new go.Binding("locationSpot", "dir", function(d) { return spotConverter(d, false); })
+        );
+
+      // selected nodes show a button for adding children
+      myDiagram.nodeTemplate.selectionAdornmentTemplate =
+        $(go.Adornment, "Spot",
+          $(go.Panel, "Auto",
+            // this Adornment has a rectangular blue Shape around the selected node
+            $(go.Shape, { fill: null, stroke: "dodgerblue", strokeWidth: 3 }),
+            $(go.Placeholder, { margin: new go.Margin(4, 4, 0, 4) })
+          ),
+          // and this Adornment has a Button to the right of the selected node
+          $("Button",
+            {
+              alignment: go.Spot.Right,
+              alignmentFocus: go.Spot.Left,
+              click: addNodeAndLink  // define click behavior for this Button in the Adornment
+            },
+            $(go.TextBlock, "+",  // the Button content
+              { font: "bold 8pt sans-serif" })
+          )
+        );
+
+      // the context menu allows users to change the font size and weight,
+      // and to perform a limited tree layout starting at that node
+      myDiagram.nodeTemplate.contextMenu =
+        $("ContextMenu",
+          $("ContextMenuButton",
+            $(go.TextBlock, "Bigger"),
+            { click: function(e, obj) { changeTextSize(obj, 1.1); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Smaller"),
+            { click: function(e, obj) { changeTextSize(obj, 1 / 1.1); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Bold/Normal"),
+            { click: function(e, obj) { toggleTextWeight(obj); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Copy"),
+            { click: function(e, obj) { e.diagram.commandHandler.copySelection(); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Delete"),
+            { click: function(e, obj) { e.diagram.commandHandler.deleteSelection(); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Undo"),
+            { click: function(e, obj) { e.diagram.commandHandler.undo(); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Redo"),
+            { click: function(e, obj) { e.diagram.commandHandler.redo(); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Layout"),
+            {
+              click: function(e, obj) {
+                var adorn = obj.part;
+                adorn.diagram.startTransaction("Subtree Layout");
+                layoutTree(adorn.adornedPart);
+                adorn.diagram.commitTransaction("Subtree Layout");
+              }
+            }
+          )
+        );
+
+      // a link is just a Bezier-curved line of the same color as the node to which it is connected
+      myDiagram.linkTemplate =
+        $(go.Link,
+          {
+            curve: go.Link.Bezier,
+            fromShortLength: -2,
+            toShortLength: -2,
+            selectable: false
+          },
+          $(go.Shape,
+            { strokeWidth: 3 },
+            new go.Binding("stroke", "toNode", function(n) {
+              if (n.data.brush) return n.data.brush;
+              return "black";
+            }).ofObject())
+        );
+
+      // the Diagram's context menu just displays commands for general functionality
+      myDiagram.contextMenu =
+        $("ContextMenu",
+          $("ContextMenuButton",
+            $(go.TextBlock, "Paste"),
+            { click: function (e, obj) { e.diagram.commandHandler.pasteSelection(e.diagram.toolManager.contextMenuTool.mouseDownPoint); } },
+            new go.Binding("visible", "", function(o) { return o.diagram && o.diagram.commandHandler.canPasteSelection(o.diagram.toolManager.contextMenuTool.mouseDownPoint); }).ofObject()),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Undo"),
+            { click: function(e, obj) { e.diagram.commandHandler.undo(); } },
+            new go.Binding("visible", "", function(o) { return o.diagram && o.diagram.commandHandler.canUndo(); }).ofObject()),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Redo"),
+            { click: function(e, obj) { e.diagram.commandHandler.redo(); } },
+            new go.Binding("visible", "", function(o) { return o.diagram && o.diagram.commandHandler.canRedo(); }).ofObject()),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Save"),
+            { click: function(e, obj) { save(); } }),
+          $("ContextMenuButton",
+            $(go.TextBlock, "Load"),
+            { click: function(e, obj) { load(); } })
+        );
+
+      myDiagram.addDiagramListener("SelectionMoved", function(e) {
+        var rootX = myDiagram.findNodeForKey(0).location.x;
+        myDiagram.selection.each(function(node) {
+          if (node.data.parent !== 0) return; // Only consider nodes connected to the root
+          var nodeX = node.location.x;
+          if (rootX < nodeX && node.data.dir !== "right") {
+            updateNodeDirection(node, "right");
+          } else if (rootX > nodeX && node.data.dir !== "left") {
+            updateNodeDirection(node, "left");
+          }
+          layoutTree(node);
+        });
+      });
+
+      // read in the predefined graph using the JSON format data held in the "mySavedModel" textarea
+      load();
+    }
+
+    function spotConverter(dir, from) {
+      if (dir === "left") {
+        return (from ? go.Spot.Left : go.Spot.Right);
+      } else {
+        return (from ? go.Spot.Right : go.Spot.Left);
+      }
+    }
+
+    function changeTextSize(obj, factor) {
+      var adorn = obj.part;
+      adorn.diagram.startTransaction("Change Text Size");
+      var node = adorn.adornedPart;
+      var tb = node.findObject("TEXT");
+      tb.scale *= factor;
+      adorn.diagram.commitTransaction("Change Text Size");
+    }
+
+    function toggleTextWeight(obj) {
+      var adorn = obj.part;
+      adorn.diagram.startTransaction("Change Text Weight");
+      var node = adorn.adornedPart;
+      var tb = node.findObject("TEXT");
+      // assume "bold" is at the start of the font specifier
+      var idx = tb.font.indexOf("bold");
+      if (idx < 0) {
+        tb.font = "bold " + tb.font;
+      } else {
+        tb.font = tb.font.substr(idx + 5);
+      }
+      adorn.diagram.commitTransaction("Change Text Weight");
+    }
+
+    function updateNodeDirection(node, dir) {
+      myDiagram.model.setDataProperty(node.data, "dir", dir);
+      // recursively update the direction of the child nodes
+      var chl = node.findTreeChildrenNodes(); // gives us an iterator of the child nodes related to this particular node
+      while (chl.next()) {
+        updateNodeDirection(chl.value, dir);
+      }
+    }
+
+    function addNodeAndLink(e, obj) {
+      var adorn = obj.part;
+      var diagram = adorn.diagram;
+      diagram.startTransaction("Add Node");
+      var oldnode = adorn.adornedPart;
+      var olddata = oldnode.data;
+      // copy the brush and direction to the new node data
+      var newdata = { text: "idea", brush: olddata.brush, dir: olddata.dir, parent: olddata.key };
+      diagram.model.addNodeData(newdata);
+      layoutTree(oldnode);
+      diagram.commitTransaction("Add Node");
+
+      // if the new node is off-screen, scroll the diagram to show the new node
+      var newnode = diagram.findNodeForData(newdata);
+      if (newnode !== null) diagram.scrollToRect(newnode.actualBounds);
+    }
+
+    function layoutTree(node) {
+      if (node.data.key === 0) {  // adding to the root?
+        layoutAll();  // lay out everything
+      } else {  // otherwise lay out only the subtree starting at this parent node
+        var parts = node.findTreeParts();
+        layoutAngle(parts, node.data.dir === "left" ? 180 : 0);
+      }
+    }
+
+    function layoutAngle(parts, angle) {
+      var layout = go.GraphObject.make(go.TreeLayout,
+        {
+          angle: angle,
+          arrangement: go.TreeLayout.ArrangementFixedRoots,
+          nodeSpacing: 5,
+          layerSpacing: 20,
+          setsPortSpot: false, // don't set port spots since we're managing them with our spotConverter function
+          setsChildPortSpot: false
+        });
+      layout.doLayout(parts);
+    }
+
+    function layoutAll() {
+      var root = myDiagram.findNodeForKey(0);
+      if (root === null) return;
+      myDiagram.startTransaction("Layout");
+      // split the nodes and links into two collections
+      var rightward = new go.Set(/*go.Part*/);
+      var leftward = new go.Set(/*go.Part*/);
+      root.findLinksConnected().each(function(link) {
+        var child = link.toNode;
+        if (child.data.dir === "left") {
+          leftward.add(root);  // the root node is in both collections
+          leftward.add(link);
+          leftward.addAll(child.findTreeParts());
+        } else {
+          rightward.add(root);  // the root node is in both collections
+          rightward.add(link);
+          rightward.addAll(child.findTreeParts());
+        }
+      });
+      // do one layout and then the other without moving the shared root node
+      layoutAngle(rightward, 0);
+      layoutAngle(leftward, 180);
+      myDiagram.commitTransaction("Layout");
+    }
+
+    // Show the diagram's model in JSON format
+    function save() {
+      document.getElementById("mySavedModel").value = myDiagram.model.toJson();
+      myDiagram.isModified = false;
+    }
+    function load() {
+      myDiagram.model = go.Model.fromJson(document.getElementById("mySavedModel").value);
+    }
+  </script>
+</head>
+<body onload="init()">
+<div id="sample">
+  <div id="myDiagramDiv" style="width:100%; height:600px"></div>
+  <button id="SaveButton" onclick="save()">Save</button>
+  <button onclick="load()">Load</button>
+  <button onclick="layoutAll()">Layout</button>
+  <textarea id="mySavedModel" style="width:100%;height:400px">
+{ "class": "TreeModel",
+  "nodeDataArray": [ 
+{"key":0, "text":"Веб-аналитика \nв киберспорте", "loc":"-225 79", "defenition":"измерение, сбор, анализ и предоставление информации о данных в целях понимания и оптимизации исследуемого объекта. В широком смысле веб-аналитика - совокупность методологий для обработки веб-данных, с использованием веб-технологий."},
+{"key":1, "parent":0, "text":"Инструментарий\nвеб-аналитики", "brush":"skyblue", "dir":"right", "loc":"-114.56494140625 34.25218653917311", "defenition":"программное обеспечение или веб-сервисы, используемые для воздействия на исследуемый объект: его изменения или измерения в целях достижения полезного эффекта."},
+{"key":12, "parent":1, "text":"Веб-сервис", "brush":"skyblue", "dir":"right", "loc":"5.98828125 21.25218653917311", "defenition":"набор открытых протоколов и стандартов, используемых для обмена данными между приложениями или системам."},
+{"key":13, "parent":1, "text":"Api", "brush":"skyblue", "dir":"right", "loc":"5.98828125 47.25218653917311", "defenition":"описание способов (набор классов, процедур, функций, структур или констант), которыми одна компьютерная программа может взаимодействовать с другой программой."},
+{"key":2, "parent":0, "text":"Анализ данных", "brush":"darkseagreen", "dir":"right", "loc":"-114.56494140625 164.94239353895188", "defenition":"описание способов (набор классов, процедур, функций, структур или констант), которыми одна компьютерная программа может взаимодействовать с другой программой."},
+{"key":21, "parent":2, "text":"Наука о данных\n(Data science)", "brush":"darkseagreen", "dir":"right", "loc":"-2.0478515625 80.32564549207687", "defenition":"совокупность методов, используемых при попытке извлечь из данных идеи и информацию, с помощью статистики, математики, программирования, сбора данных, операций по очистке, подготовке и согласованию данных."},
+{"key":22, "parent":2, "text":"Статистический анализ\n", "brush":"darkseagreen", "dir":"right", "loc":"-2.0478515625 249.55914158582684", "defenition":"процесс изучения, сопоставления, сравнения полученных цифровых данных (между собой и с данными других отраслей социально-экономической статистики), их обобщения, истолкования и формулирования научных и практических выводов."},
+{"key":3, "parent":0, "text":"Киберспорт\n", "brush":"palevioletred", "dir":"left", "loc":"-245 96.07783203125", "defenition":"соревнования в виртуальном пространстве, где игра представляет собой взаимодействие объектов управления, обеспечивая равные условия состязаний человека с человеком или команды с командой."},
+{"key":31, "parent":3, "text":"Киберспортивная \nдисциплина", "brush":"palevioletred", "dir":"left", "loc":"-335.26220703125 73.28891601562499","defenition":"популярная видеоигра с элементами соревновательной игры между игроками, в которой фактор умения преобладает над фактором случайности."},
+{"key":32, "parent":3, "text":" Ставки", "brush":"palevioletred", "dir":"left", "loc":"-335.26220703125 118.866748046875", "defenition":"сумма денег или какие-либо ценности, «поставленные» игроком «на кон» (то есть, вложенные в игру), которые могут быть потеряны при неудаче, а также условия выигрыша или проигрыша."},
+{"key":331, "parent":31, "text":"Киберспортивная \nорганизация", "brush":"palevioletred", "dir":"left", "loc":"-461.14111328125 73.28891601562499", "defenition": "компания или содружество игроков, участвующая в киберспортивных турнирах по тем или иным киберспортивным дисциплинам."},
+{"text":"Тренд", "brush":"darkseagreen", "dir":"right", "parent":22, "key":-17, "loc":"159.796875 223.55914158582686", "defenition":"тенденция изменения показателей временного ряда. Тренды могут быть описаны различными функциями — линейными, степенными, экспоненциальными и т. д. Тип тренда устанавливают на основе данных временного ряда, путем осреднения показателей динамики ряда, на основе статистической проверки гипотезы о постоянстве параметров графика о постоянстве параметров графика."},
+{"text":"Выборка", "brush":"darkseagreen", "dir":"right", "parent":22, "key":-18, "loc":"159.796875 249.55914158582686", "defenition":"часть генеральной совокупности элементов, которая охватывается экспериментом (наблюдением, опросом)."},
+{"text":"Статистические методы", "brush":"darkseagreen", "dir":"right", "parent":22, "key":-19, "loc":"159.796875 275.55914158582686", "defenition":"методы анализа статистических данных. Выделяют методы прикладной статистики, которые могут применяться во всех областях научных исследований и любых отраслях народного хозяйства, и другие статистические методы, применимость которых ограничена той или иной сферой."},
+{"text":"Метрика", "brush":"darkseagreen", "dir":"right", "parent":-18, "key":-20, "loc":"232.92041015625 249.55914158582686", "defenition":"это качественный или количественный показатель, который отражает ту или иную характеристику."},
+{"text":"Трендовая модель", "brush":"darkseagreen", "dir":"right", "parent":-17, "key":-21, "loc":"216.232421875 223.55914158582686", "defenition":"динамическая модель, в которой развитие моделируемой экономической системы отражается через тренд ее основных показателей (в частности, тренд средних величин этих показателей, их дисперсии, минимальных или максимальных уровней)."},
+{"text":"Большие данные\n(Big Data)", "brush":"darkseagreen", "dir":"right", "parent":21, "key":-22, "loc":"113.5986328125 21.592149398326853", "defenition":"огромные объемы данных, которые невозможно эффективно обработать с помощью существующих традиционных приложений. Обработка больших данных начинается с необработанных данных, которые не агрегируются и чаще всего не хранятся в памяти одного компьютера."},
+{"text":"Аналитика данных\n(Data Analitics)", "brush":"darkseagreen", "dir":"right", "parent":21, "key":-23, "loc":"113.5986328125 60.74781346082685", "defenition":"наука изучения необработанных данных для формирования вывода об этой информации."},
+{"text":"Добыча данных\n(Data Mining)", "brush":"darkseagreen", "dir":"right", "parent":21, "key":-24, "loc":"113.5986328125 99.90347752332687", "defenition":"это процесс обнаружения шаблонов в больших наборах данных с использованием методов на стыке машинного обучения, статистики и систем баз данных."},
+{"text":"Машинное обучение\n(Machine learning)", "brush":"darkseagreen", "dir":"right", "parent":21, "key":-25, "loc":"113.5986328125 139.05914158582686", "defenition":"метод анализа данных, который автоматизирует построение аналитической модели. Это отрасль искусственного интеллекта, основанная на идее, что системы могут учиться на основе данных, выявлять закономерности и принимать решения с минимальным вмешательством человека."},
+{"text":"Логистическая регрессия", "brush":"darkseagreen", "dir":"right", "parent":-25, "key":-26, "loc":"258.48876953125 80.55914158582686", "defenition":"одним из статистических методов классификации с использованием линейного дискриминанта Фишера и входит в топ часто используемых алгоритмов в науке о данных. В методе логистической регрессии значением функции является вероятность того, что данное исходное значение принадлежит к определенному классу."},
+{"text":"Байесовская сеть", "brush":"darkseagreen", "dir":"right", "parent":-25, "key":-27, "loc":"258.48876953125 106.55914158582686", "defenition":"это ациклический ориентированный граф, в котором каждая вершина (узел сети) представляет n-значную переменную, дуги обозначают существование непосредственных причинно-следственных зависимостей между соединенными переменными, а сила этих зависимостей количественно выражается в виде условных вероятностей, сопоставленных каждой из переменных."},
+{"text":"Дерево принятия решений", "brush":"darkseagreen", "dir":"right", "parent":-25, "key":-28, "loc":"258.48876953125 132.55914158582686", "defenition":"разновидность схемы, где показаны возможные последствия принятия серии связанных между собой решений. Такой подход позволяет отдельным лицам и целым организациям взвесить разные варианты действий, принимая во внимание вовлеченные затраты, преимущества и уровни вероятности. Деревья решений применяются как в неформальных дискуссиях, так и в разработке алгоритмов для прогнозирования оптимального варианта действий математическим способом."},
+{"text":"Метод опорных векторов (SVM)", "brush":"darkseagreen", "dir":"right", "parent":-25, "key":-29, "loc":"258.48876953125 158.55914158582686", "defenition":"один из наиболее популярных методов обучения, который применяется для решения задач классификации и регрессии. Основная идея метода заключается в построении гиперплоскости, разделяющей объекты выборки оптимальным способом. Алгоритм работает в предположении, что чем больше расстояние (зазор) между разделяющей гиперплоскостью и объектами разделяемых классов, тем меньше будет средняя ошибка классификатора."},
+{"text":"Нейронные сети", "brush":"darkseagreen", "dir":"right", "parent":-25, "key":-30, "loc":"258.48876953125 197.55914158582686", "defenition":"структура, состоящую из искусственных нейронов, определенным образом связанных друг с другом и внешней средой с помощью связей, каждая из которых имеет определённый коэффициент, на который умножается поступающее через него значение (эти коэффициенты называют весами)."},
+{"text":"Свёрточные нейронные сети", "brush":"darkseagreen", "dir":"right", "parent":-30, "key":-31, "loc":"377.88671875 184.55914158582686", "defenition":"специальная архитектура нейронных сетей, предложенная Яном Лекуном, изначально нацеленная на эффективное распознавание изображений."},
+{"text":"Рекуррентные нейронные сети", "brush":"darkseagreen", "dir":"right", "parent":-30, "key":-32, "loc":"377.88671875 210.55914158582686", "defenition":"вид нейронных сетей, где связи между элементами образуют направленную последовательность."},
+{"text":"Прогнозирование", "brush":"palevioletred", "dir":"left", "parent":32, "key":-33, "loc":"-397.5439453125 118.866748046875", "defenition":"процесс разработки (формирования) прогноза, состоящий из этапов. Этап прогнозирования часть процесса разработки прогнозов, характеризующаяся своими задачами, методами и результатами."},
+{"text":"Метод прогнозирования", "brush":"palevioletred", "dir":"left", "parent":-33, "key":-34, "loc":"-523.69580078125 105.866748046875", "defenition":"способ исследования объекта прогнозирования, направленный на разработку прогноза."},
+{"text":"Модель прогнозирования", "brush":"palevioletred", "dir":"left", "parent":-33, "key":-35, "loc":"-523.69580078125 131.866748046875", "defenition":"модель объекта прогнозирования, исследование которой позволяет получить информацию о возможных состояниях объекта прогнозирования в будущем и (или) путях и сроках их осуществления."}
+ ]}
+  </textarea>
+
+</div>
+</body>
+</html>
